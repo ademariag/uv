@@ -2057,11 +2057,11 @@ pub struct Package {
     /// Named `resolution-markers` in `uv.lock`.
     fork_markers: Vec<UniversalMarker>,
     /// The resolved dependencies of the package.
-    dependencies: Vec<Dependency>,
+    pub(crate) dependencies: Vec<Dependency>,
     /// The resolved optional dependencies of the package.
-    optional_dependencies: BTreeMap<ExtraName, Vec<Dependency>>,
+    pub(crate) optional_dependencies: BTreeMap<ExtraName, Vec<Dependency>>,
     /// The resolved PEP 735 dependency groups of the package.
-    dependency_groups: BTreeMap<GroupName, Vec<Dependency>>,
+    pub(crate) dependency_groups: BTreeMap<GroupName, Vec<Dependency>>,
     /// The exact requirements from the package metadata.
     metadata: PackageMetadata,
 }
@@ -2873,6 +2873,16 @@ impl Package {
     pub fn dependency_groups(&self) -> &BTreeMap<GroupName, BTreeSet<Requirement>> {
         &self.metadata.dependency_groups
     }
+
+    /// Returns the requires-dist entries for the package.
+    pub fn requires_dist(&self) -> &BTreeSet<Requirement> {
+        &self.metadata.requires_dist
+    }
+
+    /// Returns the resolved dependencies of the package.
+    pub fn dependencies(&self) -> &[Dependency] {
+        &self.dependencies
+    }
 }
 
 /// Attempts to construct a `VerbatimUrl` from the given normalized `Path`.
@@ -3011,7 +3021,7 @@ impl PackageWire {
 /// of the name, the version and the source url.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) struct PackageId {
+pub struct PackageId {
     pub(crate) name: PackageName,
     pub(crate) version: Option<Version>,
     source: Source,
@@ -3058,6 +3068,16 @@ impl PackageId {
             }
             self.source.to_toml(table);
         }
+    }
+
+    /// Returns the package name.
+    pub fn name(&self) -> &PackageName {
+        &self.name
+    }
+
+    /// Returns the package version, if any.
+    pub fn version(&self) -> Option<&Version> {
+        self.version.as_ref()
     }
 }
 
@@ -4455,7 +4475,7 @@ impl TryFrom<WheelWire> for Wheel {
 
 /// A single dependency of a package in a lockfile.
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-struct Dependency {
+pub struct Dependency {
     package_id: PackageId,
     extra: BTreeSet<ExtraName>,
     /// A marker simplified from the PEP 508 marker in `complexified_marker`
@@ -4539,6 +4559,21 @@ impl Dependency {
         }
 
         table
+    }
+
+    /// Returns the package ID for this dependency.
+    pub fn package_id(&self) -> &PackageId {
+        &self.package_id
+    }
+
+    /// Returns the extra names for this dependency.
+    pub fn extra(&self) -> &BTreeSet<ExtraName> {
+        &self.extra
+    }
+
+    /// Returns the simplified marker for this dependency as a string, if any.
+    pub fn marker_string(&self) -> Option<String> {
+        self.simplified_marker.try_to_string()
     }
 }
 

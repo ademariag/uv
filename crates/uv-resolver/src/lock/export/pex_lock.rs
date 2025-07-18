@@ -97,17 +97,14 @@ pub struct PexLockedRequirement {
 pub struct PexArtifact {
     /// The artifact URL.
     pub url: String,
-    /// The filename (optional for git dependencies).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub filename: Option<String>,
     /// Hash algorithm (e.g., "sha256"). Omitted for git dependencies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub algorithm: Option<String>,
     /// Hash value. Omitted for git dependencies.  
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
-    /// Whether this is a wheel (optional for git dependencies).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Whether this is a wheel (used for sorting, but not serialized).
+    #[serde(skip_serializing)]
     pub is_wheel: Option<bool>,
 }
 
@@ -171,7 +168,6 @@ impl PexLock {
 
                     artifacts.push(PexArtifact {
                         url: git_url,
-                        filename: None,  // Git dependencies don't have filenames
                         algorithm: None, // No hash validation for git dependencies
                         hash: None,      // Let PEX handle git dependencies without hashes
                         is_wheel: None,  // Git dependencies don't specify wheel status
@@ -183,7 +179,6 @@ impl PexLock {
 
                         artifacts.push(PexArtifact {
                             url: git_url,
-                            filename: None,  // Git dependencies don't have filenames
                             algorithm: None, // No hash validation for git dependencies
                             hash: None,      // Let PEX handle git dependencies without hashes
                             is_wheel: None,  // Git dependencies don't specify wheel status
@@ -223,7 +218,6 @@ impl PexLock {
 
                 artifacts.push(PexArtifact {
                     url: wheel_url,
-                    filename: Some(wheel.filename.to_string()),
                     algorithm: Some(algorithm),
                     hash: Some(hash),
                     is_wheel: Some(true),
@@ -233,25 +227,6 @@ impl PexLock {
             // Add source distributions
             if let Some(sdist) = &package.sdist {
                 let Some(sdist_url) = sdist.url().map(std::string::ToString::to_string) else {
-                    continue;
-                };
-
-                // Handle git dependencies that may not have traditional filenames
-                let sdist_filename = if let Some(filename) = sdist.filename() {
-                    filename.to_string()
-                } else if sdist_url.starts_with("git+") {
-                    // Generate a filename for git dependencies
-                    format!(
-                        "{}-{}.tar.gz",
-                        package.id.name,
-                        package
-                            .id
-                            .version
-                            .as_ref()
-                            .map(std::string::ToString::to_string)
-                            .unwrap_or_else(|| "0.0.0".to_string())
-                    )
-                } else {
                     continue;
                 };
 
@@ -279,7 +254,6 @@ impl PexLock {
 
                 artifacts.push(PexArtifact {
                     url: sdist_url,
-                    filename: Some(sdist_filename),
                     algorithm: Some(algorithm),
                     hash: Some(hash),
                     is_wheel: Some(false),
@@ -287,15 +261,23 @@ impl PexLock {
             }
 
             if let Some(version) = package.version() {
-                // Only include packages that have at least one artifact
-                if !artifacts.is_empty() {
-                    // Collect dependencies for this package (only those with compatible artifacts)
+                // Always include packages in PEX lock format, even without artifacts
+                // This ensures that metadata like requires_dist is available for dependency resolution
+                let should_include = !artifacts.is_empty() || !package.requires_dist().is_empty();
+                if should_include {
+                    // Collect dependencies for this package using metadata requires_dist
+                    // This includes ALL optional dependencies with their extra markers
                     let mut requires_dists = Vec::new();
-                    for dep in &package.dependencies {
+
+                    // Use resolved dependencies from UV's lock format instead of requires_dist()
+                    // This ensures we get all dependencies including optional ones with proper markers
+
+                    // Process direct dependencies
+                    for dependency in package.dependencies() {
                         if let Some(dep_package) = lock
                             .packages()
                             .iter()
-                            .find(|pkg| pkg.id.name == dep.package_id.name)
+                            .find(|pkg| pkg.id.name == *dependency.package_id().name())
                         {
                             // Only exclude dependencies that are TRULY Windows-only:
                             // - Have ONLY Windows wheels AND no source distribution
@@ -316,14 +298,124 @@ impl PexLock {
                             // Include unless it's Windows-only (only Windows wheels and no sdist)
                             let has_compatible_artifacts = !only_windows_wheels || has_sdist;
 
-                            // Only include dependencies that have compatible artifacts
                             if has_compatible_artifacts {
-                                if let Some(dep_version) = dep_package.id.version.as_ref() {
-                                    // Convert package name to use underscores for PEX compatibility
-                                    let pex_package_name =
-                                        dep.package_id.name.to_string().replace('-', "_");
-                                    requires_dists
-                                        .push(format!("{}=={}", pex_package_name, dep_version));
+                                // Build the requirement string with resolved version
+                                let mut req_string = dependency.package_id().name().to_string();
+
+                                // Add resolved version constraint
+                                if let Some(version) = dep_package.version() {
+                                    req_string.push_str(&format!("=={}", version));
+                                }
+
+                                // Add marker from dependency if present
+                                if let Some(marker_str) = dependency.marker_string() {
+                                    req_string.push_str(&format!("; {}", marker_str));
+                                }
+
+                                requires_dists.push(req_string);
+                            }
+                        }
+                    }
+
+                    // Process optional dependencies (extras)
+                    for (extra_name, dependencies) in package.optional_dependencies.iter() {
+                        for dependency in dependencies {
+                            if let Some(dep_package) = lock
+                                .packages()
+                                .iter()
+                                .find(|pkg| pkg.id.name == *dependency.package_id().name())
+                            {
+                                // Only exclude dependencies that are TRULY Windows-only:
+                                // - Have ONLY Windows wheels AND no source distribution
+                                let only_windows_wheels = !dep_package.wheels.is_empty()
+                                    && dep_package.wheels.iter().all(|wheel| {
+                                        wheel.filename.platform_tags().iter().any(|tag| {
+                                            matches!(
+                                                tag,
+                                                PlatformTag::Win32
+                                                    | PlatformTag::WinAmd64
+                                                    | PlatformTag::WinArm64
+                                                    | PlatformTag::WinIa64
+                                            )
+                                        })
+                                    });
+                                let has_sdist = dep_package.sdist.is_some();
+
+                                // Include unless it's Windows-only (only Windows wheels and no sdist)
+                                let has_compatible_artifacts = !only_windows_wheels || has_sdist;
+
+                                if has_compatible_artifacts {
+                                    // Build the requirement string with resolved version
+                                    let mut req_string = dependency.package_id().name().to_string();
+
+                                    // Add resolved version constraint
+                                    if let Some(version) = dep_package.version() {
+                                        req_string.push_str(&format!("=={}", version));
+                                    }
+
+                                    // Add extra marker and combine with any existing markers
+                                    let extra_marker = format!("extra == \"{}\"", extra_name);
+                                    let combined_marker =
+                                        if let Some(dep_marker) = dependency.marker_string() {
+                                            format!("{} and {}", extra_marker, dep_marker)
+                                        } else {
+                                            extra_marker
+                                        };
+                                    req_string.push_str(&format!("; {}", combined_marker));
+
+                                    requires_dists.push(req_string);
+                                }
+                            }
+                        }
+                    }
+
+                    // Process dependency groups (PEP 735)
+                    for (group_name, dependencies) in package.dependency_groups.iter() {
+                        for dependency in dependencies {
+                            if let Some(dep_package) = lock
+                                .packages()
+                                .iter()
+                                .find(|pkg| pkg.id.name == *dependency.package_id().name())
+                            {
+                                // Only exclude dependencies that are TRULY Windows-only:
+                                // - Have ONLY Windows wheels AND no source distribution
+                                let only_windows_wheels = !dep_package.wheels.is_empty()
+                                    && dep_package.wheels.iter().all(|wheel| {
+                                        wheel.filename.platform_tags().iter().any(|tag| {
+                                            matches!(
+                                                tag,
+                                                PlatformTag::Win32
+                                                    | PlatformTag::WinAmd64
+                                                    | PlatformTag::WinArm64
+                                                    | PlatformTag::WinIa64
+                                            )
+                                        })
+                                    });
+                                let has_sdist = dep_package.sdist.is_some();
+
+                                // Include unless it's Windows-only (only Windows wheels and no sdist)
+                                let has_compatible_artifacts = !only_windows_wheels || has_sdist;
+
+                                if has_compatible_artifacts {
+                                    // Build the requirement string with resolved version
+                                    let mut req_string = dependency.package_id().name().to_string();
+
+                                    // Add resolved version constraint
+                                    if let Some(version) = dep_package.version() {
+                                        req_string.push_str(&format!("=={}", version));
+                                    }
+
+                                    // Add group marker and combine with any existing markers
+                                    let group_marker = format!("group == \"{}\"", group_name);
+                                    let combined_marker =
+                                        if let Some(dep_marker) = dependency.marker_string() {
+                                            format!("{} and {}", group_marker, dep_marker)
+                                        } else {
+                                            group_marker
+                                        };
+                                    req_string.push_str(&format!("; {}", combined_marker));
+
+                                    requires_dists.push(req_string);
                                 }
                             }
                         }
@@ -332,12 +424,12 @@ impl PexLock {
                     // Sort requires_dists for consistent output
                     requires_dists.sort();
 
-                    // Sort artifacts to match Pants ordering: source distributions first, then wheels
+                    // Sort artifacts: wheels first, then source distributions
                     artifacts.sort_by(|a, b| {
                         match (a.is_wheel, b.is_wheel) {
-                            // Source distributions (is_wheel: false) come first
-                            (Some(false), Some(true)) => std::cmp::Ordering::Less,
-                            (Some(true), Some(false)) => std::cmp::Ordering::Greater,
+                            // Wheels (is_wheel: true) come first
+                            (Some(true), Some(false)) => std::cmp::Ordering::Less,
+                            (Some(false), Some(true)) => std::cmp::Ordering::Greater,
                             // Within same type, sort by URL
                             _ => a.url.cmp(&b.url),
                         }
@@ -346,11 +438,21 @@ impl PexLock {
                     // Convert project name to use underscores for PEX compatibility
                     let pex_project_name = package.id.name.to_string().replace('-', "_");
 
+                    // Get package-specific Python requirement from metadata
+                    let package_requires_python = lock
+                        .manifest
+                        .dependency_metadata
+                        .iter()
+                        .find(|metadata| metadata.name == package.id.name)
+                        .and_then(|metadata| metadata.requires_python.as_ref())
+                        .map(|req| req.to_string())
+                        .unwrap_or_else(|| ">=3.8".to_string());
+
                     locked_requirements.push(PexLockedRequirement {
                         artifacts,
                         project_name: pex_project_name,
                         requires_dists,
-                        requires_python: lock.requires_python().to_string(),
+                        requires_python: package_requires_python,
                         version: version.to_string(),
                     });
                 }
@@ -453,7 +555,10 @@ mod tests {
             constraints: vec![],
             elide_unused_requires_dist: false,
             excluded: vec![],
-            locked_resolves: vec![],
+            locked_resolves: vec![PexLockedResolve {
+                locked_requirements: vec![],
+                platform_tag: None,
+            }],
             only_builds: vec![],
             only_wheels: vec![],
             overridden: vec![],
@@ -475,7 +580,7 @@ mod tests {
         assert!(json.contains("\"pex_version\": \"2.44.0\""));
         assert!(json.contains("\"allow_builds\": true"));
         assert!(json.contains("\"pip_version\": \"24.2\""));
-        assert!(json.contains("\"target_systems\": [\"linux\", \"mac\"]"));
+        assert!(json.contains("\"target_systems\": [\n    \"linux\",\n    \"mac\"\n  ]"));
         assert!(json.contains("\"platform_tag\": null"));
     }
 
@@ -501,16 +606,15 @@ mod tests {
     fn test_pex_artifact_structure() {
         let artifact = PexArtifact {
             url: "https://files.pythonhosted.org/packages/test.whl".to_string(),
-            filename: Some("test-1.0.0-py3-none-any.whl".to_string()),
-            algorithm: "sha256".to_string(),
-            hash: "abcd1234".to_string(),
+            algorithm: Some("sha256".to_string()),
+            hash: Some("abcd1234".to_string()),
             is_wheel: Some(true),
         };
 
         let json = serde_json::to_string(&artifact).unwrap();
-        assert!(json.contains("\"is_wheel\": true"));
-        assert!(json.contains("\"algorithm\": \"sha256\""));
-        assert!(json.contains("\"hash\": \"abcd1234\""));
+        assert!(!json.contains("\"is_wheel\""));
+        assert!(json.contains("\"algorithm\":\"sha256\""));
+        assert!(json.contains("\"hash\":\"abcd1234\""));
     }
 
     #[test]
@@ -518,9 +622,8 @@ mod tests {
         let requirement = PexLockedRequirement {
             artifacts: vec![PexArtifact {
                 url: "https://files.pythonhosted.org/packages/test.whl".to_string(),
-                filename: Some("test-1.0.0-py3-none-any.whl".to_string()),
-                algorithm: "sha256".to_string(),
-                hash: "abcd1234".to_string(),
+                algorithm: Some("sha256".to_string()),
+                hash: Some("abcd1234".to_string()),
                 is_wheel: Some(true),
             }],
             project_name: "test-package".to_string(),
@@ -530,10 +633,10 @@ mod tests {
         };
 
         let json = serde_json::to_string(&requirement).unwrap();
-        assert!(json.contains("\"project_name\": \"test-package\""));
-        assert!(json.contains("\"requires_dists\": [\"dependency>=1.0\"]"));
-        assert!(json.contains("\"requires_python\": \">=3.8\""));
-        assert!(json.contains("\"version\": \"1.0.0\""));
+        assert!(json.contains("\"project_name\":\"test-package\""));
+        assert!(json.contains("\"requires_dists\":[\"dependency>=1.0\"]"));
+        assert!(json.contains("\"requires_python\":\">=3.8\""));
+        assert!(json.contains("\"version\":\"1.0.0\""));
     }
 
     #[test]
@@ -544,20 +647,15 @@ mod tests {
         };
 
         let json = serde_json::to_string(&resolve).unwrap();
-        assert!(json.contains("\"platform_tag\": null"));
-        assert!(json.contains("\"locked_requirements\": []"));
+        assert!(json.contains("\"platform_tag\":null"));
+        assert!(json.contains("\"locked_requirements\":[]"));
     }
 
     #[test]
-    fn test_git_dependency_filename_generation() {
-        // Test the git URL detection and filename generation logic
+    fn test_git_dependency_url_detection() {
+        // Test the git URL detection logic
         let git_url = "git+https://github.com/user/repo.git";
         assert!(git_url.starts_with("git+"));
-
-        let package_name = "test-package";
-        let version = "1.5.3";
-        let expected_filename = format!("{package_name}-{version}.tar.gz");
-        assert_eq!(expected_filename, "test-package-1.5.3.tar.gz");
     }
 
     #[test]
